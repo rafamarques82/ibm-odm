@@ -3,9 +3,7 @@
 Servidor **MCP (Model Context Protocol)** para integrar clientes MCP com o **IBM ODM Decision Center** via REST API.  
 Este projeto expõe ferramentas para listar Decision Services e seus artefatos, executar test suites, acompanhar relatórios e realizar deploy de RuleApps no RES.
 
-> **Autor:** Rafael Eduardo Marques — IBM Hybrid Cloud Specialist  
-> **Local:** São Paulo, SP
-
+> **Autor:** Rafael Eduardo Marques 
 ---
 
 ## Sumário
@@ -17,16 +15,12 @@ Este projeto expõe ferramentas para listar Decision Services e seus artefatos, 
 - [Configuração](#-configuração)
 - [Execução](#-execução)
 - [Ferramentas MCP disponíveis](#-ferramentas-mcp-disponíveis)
-- [Fluxo recomendado (Gate de Teste)](#-fluxo-recomendado-gate-de-teste)
-- [Deploy com Gate de Teste (exemplo de código)](#-deploy-com-gate-de-teste-exemplo-de-código)
-- [Erros, Timeouts e Retries](#-erros-timeouts-e-retries)
-- [Paginação](#-paginação)
+- [Fluxo recomendado (Gate de Teste)](#-ferramentas-mcp-disponíveis)
+- [Exemplo de código](#-erros-timeouts-e-retries)
 - [Observabilidade e Logs](#-observabilidade-e-logs)
 - [Segurança](#-segurança)
 - [Troubleshooting](#-troubleshooting)
-- [Roadmap](#-roadmap)
-- [Contribuição](#-contribuição)
-- [Licença](#-licença)
+
 
 ---
 
@@ -201,92 +195,204 @@ Todas abaixo são funções anotadas com `@mcp.tool()`:
 
 ---
 
-## 🔒 Deploy com Gate de Teste (exemplo de código)
+## 🔒 Exemplo de código
 
 > Ferramenta MCP que **executa o test suite**, faz **poll** até estado final e só **deploy** se `PASSED`.  
 > Ajuste `poll_interval_sec` e `max_attempts` conforme o tempo típico de execução no seu ambiente.
 
 ```python
-import time
+
+import os
+import sys
+import logging
 from typing import Dict, Any, Optional
 
+import requests
+from requests.auth import HTTPBasicAuth
+from mcp.server.fastmcp import FastMCP
+
+# ------------------------------------------------------------------
+# Logging: somente em STDERR (nada em stdout além de mensagens JSON)
+# ------------------------------------------------------------------
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s'
+)
+log = logging.getLogger("decision-center-mcp")
+
+# Em STDIO, alguns stacks são sensíveis a framing; CRLF + flush imediato
+try:
+    sys.stdout.reconfigure(newline='\r\n', write_through=True)
+except Exception:
+    pass
+
+# ------------------------------------------------------------------
+# Configuração (validação adiada por ferramenta)
+# ------------------------------------------------------------------
+# --- Configuration ---
+DC_BASE_URL = "http://my-odm.ibm.com:9060/decisioncenter-api/v1"
+DC_USERNAME ="odmAdmin"
+DC_PASSWORD = "odmAdmin"
+
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio").strip().lower()
+HTTP_HOST = os.getenv("HTTP_HOST", "127.0.0.1").strip()
+HTTP_PORT = int(os.getenv("HTTP_PORT", "8000"))
+JSON_RESPONSE = os.getenv("JSON_RESPONSE", "false").lower() == "true"
+
+def ensure_config() -> Optional[Dict[str, Any]]:
+    missing = []
+    if not DC_BASE_URL: missing.append("DC_BASE_URL")
+    if not DC_USERNAME: missing.append("DC_USERNAME")
+    if not DC_PASSWORD: missing.append("DC_PASSWORD")
+    if missing:
+        msg = f"Decision Center config missing: {', '.join(missing)}"
+        log.error(msg)
+        return {"error": msg}
+    return None
+
+def build_session() -> Optional[requests.Session]:
+    err = ensure_config()
+    if err:
+        return None
+    sess = requests.Session()
+    sess.auth = HTTPBasicAuth(DC_USERNAME, DC_PASSWORD)
+    sess.headers.update({"Accept": "application/json"})
+    return sess
+
+def _url(path: str) -> str:
+    base = DC_BASE_URL.rstrip('/')
+    path = path.lstrip('/')
+    return f"{base}/{path}"
+
+def dc_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    sess = build_session()
+    if sess is None:
+        return {"error": "Configuration missing"}
+    try:
+        r = sess.get(_url(path), params=params, timeout=60)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException as e:
+        log.error(f"GET {path} failed: {e}")
+        return {"error": str(e)}
+    except ValueError:
+        log.error(f"GET {path} returned non-JSON body")
+        return {"error": "non-json-response"}
+
+def dc_post(path: str, json: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    sess = build_session()
+    if sess is None:
+        return {"error": "Configuration missing"}
+    try:
+        r = sess.post(_url(path), json=json, timeout=120)
+        r.raise_for_status()
+        try:
+            return r.json()
+        except ValueError:
+            return {"status": r.status_code}
+    except requests.exceptions.RequestException as e:
+        log.error(f"POST {path} failed: {e}")
+        return {"error": str(e)}
+
+# ------------------------------------------------------------------
+# MCP Server (SDK oficial)
+# ------------------------------------------------------------------
+mcp = FastMCP("Decision Center MCP", json_response=JSON_RESPONSE)
+
 @mcp.tool()
-def deploy_with_test_gate(
-    decision_service_id: str,
-    test_suite_id: str,
-    deployment_id: str,
-    poll_interval_sec: int = 2,
-    max_attempts: int = 60
-) -> Dict[str, Any]:
-    """
-    Executa o test suite (gate), espera concluir e só faz deploy se o status for PASSED.
-    Retorna um resumo com testReportId, testStatus e deployResult (se aplicável).
-    """
+def about() -> Dict[str, Any]:
+    """Informações do endpoint /about do Decision Center REST API."""
+    return dc_get("about")
 
-    # 1) Executa test suite
-    run = dc_post(f"testsuites/{test_suite_id}/run")
-    report_id = (run or {}).get("testReportId")
-    if not report_id:
-        return {"error": "Test suite não retornou testReportId", "runResult": run}
+@mcp.tool()
+def list_decision_services() -> Dict[str, Any]:
+    """Lista Decision Services do repositório."""
+    return dc_get("decisionservices")
 
-    # 2) Poll do test report até finalizar
-    status: Optional[str] = None
-    attempts = 0
-    last_report: Dict[str, Any] = {}
-    terminal_statuses = {"PASSED", "FAILED", "ERROR", "CANCELED"}
-    while attempts < max_attempts:
-        rep = dc_get(f"testreports/{report_id}")
-        last_report = rep if isinstance(rep, dict) else {}
-        status = last_report.get("status")
-        if status in terminal_statuses:
-            break
-        time.sleep(poll_interval_sec)
-        attempts += 1
+@mcp.tool()
+def list_branches(decision_service_id: str) -> Dict[str, Any]:
+    """Lista branches de um Decision Service (por ID)."""
+    return dc_get(f"decisionservices/{decision_service_id}/branches")
 
-    if status is None:
-        return {"error": "Falha ao obter status do relatório de teste", "testReportId": report_id}
+@mcp.tool()
+def list_test_suites(decision_service_id: str) -> Dict[str, Any]:
+    """Lista test suites de um Decision Service (por ID)."""
+    return dc_get(f"decisionservices/{decision_service_id}/testsuites")
 
-    # 3) Gate: só faz deploy se PASSED
-    if status != "PASSED":
-        return {
-            "decisionServiceId": decision_service_id,
-            "testReportId": report_id,
-            "testStatus": status,
-            "message": "Gate reprovado: deploy não executado."
-        }
+@mcp.tool()
+def run_test_suite(test_suite_id: str) -> Dict[str, Any]:
+    """Executa test suite por ID; retorna testReportId/status."""
+    return dc_post(f"testsuites/{test_suite_id}/run")
 
-    # 4) Deploy
-    deploy_res = dc_post(f"deployments/{deployment_id}/deploy")
+@mcp.tool()
+def get_test_report(test_report_id: str) -> Dict[str, Any]:
+    """Busca status/detalhes de um test report por ID."""
+    return dc_get(f"testreports/{test_report_id}")
 
-    return {
-        "decisionServiceId": decision_service_id,
-        "testReportId": report_id,
-        "testStatus": status,
-        "deployResult": deploy_res
-    }
+@mcp.tool()
+def list_servers() -> Dict[str, Any]:
+    """Lista servidores disponíveis para deploy (RES targets)."""
+    return dc_get("servers")
+
+@mcp.tool()
+def deploy_ruleapp(deployment_id: str) -> Dict[str, Any]:
+    """Faz deploy de RuleApp ao RES para um deployment configuration ID. antes de fazer o deploy, verificar se tem um relatorio de teste associado e se o mesmo foi executado com sucesso. se não foi executado com sucesso, não iniciar o deploy."""
+    return dc_post(f"deployments/{deployment_id}/deploy")
+
+@mcp.tool()
+def find_decision_service_id_by_name(name: str) -> Optional[str]:
+    """Localiza o ID de um Decision Service pelo nome. Retorna ID ou null."""
+    data = dc_get("decisionservices")
+    elems = data.get("elements", []) if isinstance(data, dict) else []
+    for el in elems:
+        if el.get("name") == name:
+            return el.get("id")
+    return None
+
+@mcp.tool()
+def get_deployments(decision_service_id: str) -> Dict[str, Any]:
+    """Lista deployment configurations de um Decision Service (se disponível)."""
+    return dc_get(f"decisionservices/{decision_service_id}/deployments")
+
+@mcp.tool()
+def get_branches_and_test_suites(name: str) -> Dict[str, Any]:
+    """Convenience: dado o nome, retorna branches e test suites."""
+    dsid = find_decision_service_id_by_name(name)
+    if not dsid:
+        return {"error": f"Decision Service '{name}' not found"}
+    branches = dc_get(f"decisionservices/{dsid}/branches")
+    testsuites = dc_get(f"decisionservices/{dsid}/testsuites")
+    return {"decisionServiceId": dsid, "branches": branches, "testsuites": testsuites}
+
+# ------------------------------------------------------------------
+# Inicialização do servidor — STDIO ou HTTP/ASGI
+#   - No SDK oficial, `run()` não aceita host/port; para HTTP use ASGI
+#   - Para STDIO (Claude Desktop), use run(transport="stdio")
+# ------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        if MCP_TRANSPORT == "http":
+            # Modo HTTP via ASGI (Uvicorn) — JSON-only recomendado para teste
+            try:
+                # Preferível quando disponível na sua versão do SDK
+                app = mcp.streamable_http_app()
+            except AttributeError:
+                # Fallback em versões que expõem apenas http_app()
+                app = mcp.http_app()
+            log.info(f"Starting ASGI (HTTP) at http://{HTTP_HOST}:{HTTP_PORT}/mcp")
+            import uvicorn
+            uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
+        else:
+            log.info("Starting MCP server (STDIO)")
+            mcp.run(transport="stdio")
+    except Exception as e:
+        log.exception(f"Fatal error in MCP server: {e}")
+
 ```
 
 ---
 
-## 🧪 Erros, Timeouts e Retries
-
-- `dc_get`: timeout padrão **60s**.  
-- `dc_post`: timeout padrão **120s**.
-- Em erros de rede/HTTP, retorna `{ "error": "<mensagem>" }`.
-
-**Melhorias recomendadas:**
-- Adicionar **retries** com backoff exponencial (`urllib3.Retry`) para timeouts/5xx.
-- Diferenciar erros **4xx** (cliente/configuração) de **5xx** (servidor).
-- Permitir configurar **timeouts** via variáveis de ambiente (p.ex. `DC_GET_TIMEOUT`, `DC_POST_TIMEOUT`).
-
----
-
-## 📄 Paginação
-
-Alguns endpoints (`decisionservices`, etc.) podem **paginar** (`elements`, `offset`, `limit`).  
-Implemente loop de paginação quando necessário para coletar todas as páginas e agregar `elements`.
-
----
 
 ## 📊 Observabilidade e Logs
 
@@ -314,26 +420,3 @@ Implemente loop de paginação quando necessário para coletar todas as páginas
 - **Deploy sem validação**: prefira `deploy_with_test_gate` para bloquear promoção sem testes aprovados.
 
 ---
-
-## 📈 Roadmap
-
-- [ ] `deploy_with_test_gate` com retries e timeouts configuráveis
-- [ ] Paginação automática de `elements`
-- [ ] HTTPS com `sess.verify` e CA interno
-- [ ] Observabilidade (latência, correlation-id)
-- [ ] Validação adicional de pré-condições de deploy (branch/labels)
-
----
-
-## 🤝 Contribuição
-
-1. Crie um branch: `feature/minha-melhoria`  
-2. Commit: `git commit -m "Implementa X"`  
-3. Push: `git push origin feature/minha-melhoria`  
-4. Abra um **Pull Request** com descrição e exemplos.
-
----
-
-## 📜 Licença
-
-Defina a licença conforme as políticas da sua organização (ex.: `MIT`, `Apache-2.0` ou **proprietária** para uso interno).
